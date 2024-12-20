@@ -1,0 +1,205 @@
+import streamlit as st
+import pdfplumber
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter 
+from langchain.vectorstores import FAISS
+from langchain.prompts import PromptTemplate
+from langchain.chains.question_answering import load_qa_chain
+from langchain.llms import OpenAI
+from langchain.chat_models import ChatOpenAI
+import os
+
+# Set OpenAI API key
+os.environ["OPENAI_API_KEY"] = ""
+
+# Directories for uploads and FAISS indices
+UPLOAD_DIR = r"C:\\Users\\Dell\\Documents\\vocso_python\\haystack_rag\\upload"
+INDEX_DIR = r"C:\\Users\\Dell\\Documents\\vocso_python\\haystack_rag\\faiss_plumber"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(INDEX_DIR, exist_ok=True)
+
+# Streamlit UI
+def process_file(uploaded_file):
+    """ Process the uploaded file, extract text and create FAISS index. """
+    file_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
+    with open(file_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    st.sidebar.write(f"Uploaded: {uploaded_file.name}")
+
+    # Extract text from the file
+    raw_text = ''
+    if uploaded_file.name.endswith(".pdf"):
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                content = page.extract_text()
+                if content:
+                    raw_text += content
+    elif uploaded_file.name.endswith(".txt"):
+        with open(file_path, "r", encoding="utf-8") as f:
+            raw_text = f.read()
+
+    # Split text into chunks using RecursiveCharacterTextSplitter
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800,
+        chunk_overlap=200,
+        length_function=len,
+        separators=["\n\n", "\n", " ", ""]
+    )
+    texts = text_splitter.split_text(raw_text)
+
+    # Create embeddings and FAISS index
+    embedding = OpenAIEmbeddings()
+    document_search = FAISS.from_texts(texts, embedding)
+
+    # Save the FAISS index
+    index_file_path = os.path.join(INDEX_DIR, f"{uploaded_file.name}.index")
+    document_search.save_local(index_file_path)
+    st.sidebar.success(f"FAISS index saved as: {uploaded_file.name}.index")
+    return document_search
+
+
+def get_answer_from_docs(document_search, query1):
+    """ Retrieve and return the answer to the user's query from the documents. """
+    # Define the prompt template
+    qa_template = PromptTemplate(
+        input_variables=["context", "question"],
+        template=(
+            "You are an expert assistant. Answer the question based on the given context. "
+            "Make sure to include the page number where the answer is found. If no information is available, "
+            "respond with 'The answer is not available in the provided context.' "
+            "\n\nContext: {context}\n\nQuestion: {question}"
+        )
+    )
+
+    # Retrieve relevant document sections
+    docs = document_search.similarity_search(query1)
+
+    if docs:  # Check if relevant documents are found
+        # Combine the content from the retrieved documents
+        context = " ".join([doc.page_content for doc in docs])
+
+        # Format the query using the prompt template
+        formatted_query = qa_template.format(context=context, question=query1)
+
+        # Pass the formatted query to the language model
+        chain = load_qa_chain(OpenAI(), chain_type="stuff")
+        answer = chain.run(input_documents=docs, question=formatted_query)
+        return answer
+    else:
+        return "No relevant documents found. Try rephrasing your query."
+
+
+def get_summary_from_docs(document_search):
+    """
+    Process each query in query_headings and display answers directly in the Streamlit UI.
+    """
+
+    # Define the main prompt template
+    qa_template = PromptTemplate(
+        input_variables=["context", "question"],
+        template=(
+            "You are an expert assistant. Answer the question based on the given context. "
+            "Make sure to include the page number where the answer is found. If no information is available, "
+            "respond with 'The answer is not available in the provided context.' "
+            "\n\nContext: {context}\n\nQuestion: {question}"
+        )
+    )
+
+    # List of queries and their corresponding headings
+    query_headings = {
+        "give me a summary of this document, including key points and highlights": "Summary",
+        "who is the issuing authority and end client for this rfp": "Organization/Authority",
+        "what is the Project Background in Objective of the project and Background information ?": "Project Overview and Objectives",
+        "show all important dates and deadlines": "Important Dates",
+        "what is the project timeline, including key milestones?": "Timeline",
+        "provide details about the project location and logistics, including site visit requirements": "Project Location and Logistics",
+        "what financial information, such as budget constraints or funding details, is provided?": "Financial Details",
+        "how will proposals be evaluated, and what are the criteria for selection?": "Evaluation Criteria",
+        "what are the legal terms, conditions, and compliance requirements in this RFP?": "Terms and Conditions",
+        "who are the key contacts for communication and queries?": "Key Contacts",
+        "what qualifications and eligibility criteria are required for vendors?": "Eligibility Criteria",
+        "give me Submission Instructions details, Key submission details and deadlines": "Bid Submission Requirements",
+    }
+
+    # Initialize the LLM (using GPT-3.5-turbo)
+    llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
+
+    # Process each query and display responses under corresponding headings
+    for query, heading in query_headings.items():
+        # Display heading in the UI
+        st.write(f"### {heading}")
+
+        # Perform similarity search for the current query
+        docs = document_search.similarity_search(query)
+
+        if docs:  # Check if relevant documents are found
+            # Combine the content from the retrieved documents
+            context = " ".join([doc.page_content for doc in docs])
+
+            # Format the query using the prompt template
+            formatted_query = qa_template.format(context=context, question=query)
+
+            # Use LangChain's chain to process the query
+            chain = load_qa_chain(llm, chain_type="stuff")
+            try:
+                answer = chain.run(input_documents=docs, question=formatted_query)
+                st.write(answer.strip())  # Display the answer
+            except Exception as e:
+                st.error(f"Error processing query: {query}. Details: {e}")
+        else:
+            st.write("No relevant documents found for this section.")
+
+
+
+
+def main():
+    st.title("Documents Chatbot")
+
+    # Sidebar for file uploads
+    uploaded_files = st.sidebar.file_uploader("Upload files", type=["pdf", "txt"], accept_multiple_files=True)
+
+    # Process uploaded files and save FAISS index
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            document_search = process_file(uploaded_file)
+
+    # Select and load FAISS index for querying
+    st.sidebar.write("### Choose Document for Query")
+    try:
+        index_files = [f for f in os.listdir(INDEX_DIR) if f.endswith(".index")]
+        if index_files:
+            selected_index = st.sidebar.selectbox("Select a file", options=index_files)
+            if selected_index:
+                index_file_path = os.path.join(INDEX_DIR, selected_index)
+                document_search = FAISS.load_local(index_file_path, OpenAIEmbeddings(), allow_dangerous_deserialization=True)
+
+                st.success(f"Document '{selected_index}' loaded successfully!")
+
+                # Question answering
+                st.write("### Ask a question based on the selected Document")
+                query1 = st.text_input("Enter your question:")
+
+                if st.button("Get Answer"):
+                    try:
+                        answer = get_answer_from_docs(document_search, query1)
+                        st.write("**Answer:**", answer)
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+
+                # Summary generation
+                st.write("### Summary for this Document")
+
+                if st.button("Get Summary"):
+                    try:
+                        get_summary_from_docs(document_search)
+                        
+                    except Exception as e:
+                        st.error(f"Error during summary generation: {e}")
+
+        else:
+            st.sidebar.write("No Document Files Found.")
+    except Exception as e:
+        st.sidebar.error(f"Error loading FAISS index: {e}")
+
+if __name__ == "__main__":
+    main()
